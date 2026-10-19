@@ -3,8 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Jelly POC</title>
-<link rel="icon" href="data:,">
+<title>戳一戳果冻一家</title>
+<meta name="description" content="一家五口的 Q 弹小果冻，拖一拖、戳一戳、看它们一起跳。">
+<meta property="og:title" content="戳一戳果冻一家">
+<meta property="og:description" content="一家五口的 Q 弹小果冻，拖一拖、戳一戳、看它们一起跳。">
+<meta property="og:image" content="https://gerryke.github.io/jelly-poc/share.png">
+<meta property="og:url" content="https://gerryke.github.io/jelly-poc/">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary">
+<link rel="icon" type="image/png" href="apple-touch-icon.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
 <style>
   html, body { margin: 0; height: 100%; background: #FFF6E8; overflow: hidden; touch-action: none; }
   canvas { display: block; width: 100vw; height: 100vh; }
@@ -13,6 +21,7 @@
 </style>
 </head>
 <body>
+<img src="share.png" alt="" width="600" height="600" style="position:absolute;width:0;height:0;opacity:0;pointer-events:none">
 <canvas id="c"></canvas>
 <div id="hint">拖一拖 · 点一下戳它 · 点空白处一起跳 · ← → 倾斜 · 空格跳</div>
 <script>
