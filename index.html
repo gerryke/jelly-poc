@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Jelly POC</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; background: #FFF6E8; overflow: hidden; touch-action: none; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #hint { position: fixed; top: 24px; width: 100%; text-align: center; color: #9A8878;
+          font: 15px -apple-system, "PingFang SC", sans-serif; pointer-events: none; transition: opacity 1s; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">拖一拖 · 点一下戳它 · 点空白处一起跳 · ← → 倾斜 · 空格跳</div>
+<script>
+// 网页版原型：一圈 Verlet 质点 + 边长约束 + 内部气压 + 形状回弹（shape matching）
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, floorY = 0, world = {};
+const STEP = 1 / 120, G = 1700;
+let tilt = 0;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  floorY = H * 0.85;
+  world = { minX: 6, maxX: W - 6, minY: 20, maxY: floorY };
+}
+addEventListener('resize', resize);
+resize();
+
+function shade(hex, amt) {
+  const n = parseInt(hex.slice(1), 16);
+  const f = c => Math.round(c * (1 - amt));
+  return `rgb(${f(n >> 16 & 255)},${f(n >> 8 & 255)},${f(n & 255)})`;
+}
+
+class Blob {
+  constructor(x, y, r, color, n = 26) {
+    this.n = n; this.r = r; this.color = color;
+    this.unit = []; this.pos = []; this.prev = [];
+    for (let i = 0; i < n; i++) {
+      const a = i / n * Math.PI * 2;
+      this.unit.push([Math.cos(a), Math.sin(a)]);
+      this.pos.push([x + Math.cos(a) * r, y + Math.sin(a) * r]);
+      this.prev.push([x + Math.cos(a) * r, y + Math.sin(a) * r]);
+    }
+    this.cx = x; this.cy = y; this.vx = 0; this.vy = 0;
+    this.excitedUntil = 0; this.nextBlink = 0; this.blinkUntil = 0;
+    this.grounded = false;
+  }
+  get restArea() { return 0.5 * this.n * this.r * this.r * Math.sin(2 * Math.PI / this.n); }
+
+  integrate(gx, gy) {
+    const max = this.r * 0.5;
+    for (let i = 0; i < this.n; i++) {
+      const p = this.pos[i], q = this.prev[i];
+      let vx = (p[0] - q[0]) * 0.998, vy = (p[1] - q[1]) * 0.998;
+      const l = Math.hypot(vx, vy);
+      if (l > max) { vx *= max / l; vy *= max / l; }
+      q[0] = p[0]; q[1] = p[1];
+      p[0] += vx + gx * STEP * STEP; p[1] += vy + gy * STEP * STEP;
+    }
+  }
+  centroid() {
+    let x = 0, y = 0;
+    for (const p of this.pos) { x += p[0]; y += p[1]; }
+    this.cx = x / this.n; this.cy = y / this.n;
+  }
+  solveShape(k) {
+    this.centroid();
+    let s = 0, c = 0;
+    for (let i = 0; i < this.n; i++) {
+      const u = this.unit[i], dx = this.pos[i][0] - this.cx, dy = this.pos[i][1] - this.cy;
+      c += u[0] * dx + u[1] * dy; s += u[0] * dy - u[1] * dx;
+    }
+    const a = Math.atan2(s, c), ca = Math.cos(a), sa = Math.sin(a);
+    for (let i = 0; i < this.n; i++) {
+      const ux = this.unit[i][0] * this.r, uy = this.unit[i][1] * this.r;
+      const gx = this.cx + ux * ca - uy * sa, gy = this.cy + ux * sa + uy * ca;
+      this.pos[i][0] += (gx - this.pos[i][0]) * k;
+      this.pos[i][1] += (gy - this.pos[i][1]) * k;
+    }
+  }
+  solveEdges(k) {
+    const rest = 2 * this.r * Math.sin(Math.PI / this.n);
+    for (let i = 0; i < this.n; i++) {
+      const a = this.pos[i], b = this.pos[(i + 1) % this.n];
+      const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy);
+      if (l < 1e-9) continue;
+      const f = (l - rest) / l * 0.5 * k;
+      a[0] += dx * f; a[1] += dy * f; b[0] -= dx * f; b[1] -= dy * f;
+    }
+  }
+  solvePressure(k) {
+    let area = 0, per = 0;
+    for (let i = 0; i < this.n; i++) {
+      const a = this.pos[i], b = this.pos[(i + 1) % this.n];
+      area += a[0] * b[1] - a[1] * b[0];
+      per += Math.hypot(b[0] - a[0], b[1] - a[1]);
+    }
+    area *= 0.5;
+    const push = (this.restArea - area) / per * k;
+    const old = this.pos.map(p => [p[0], p[1]]);
+    for (let i = 0; i < this.n; i++) {
+      const nx = old[(i + 1) % this.n], pv = old[(i + this.n - 1) % this.n];
+      let tx = nx[0] - pv[0], ty = nx[1] - pv[1];
+      const l = Math.hypot(tx, ty) || 1;
+      this.pos[i][0] += ty / l * push; this.pos[i][1] += -tx / l * push;
+    }
+  }
+  solveBounds() {
+    for (const p of this.pos) {
+      p[0] = Math.min(Math.max(p[0], world.minX), world.maxX);
+      p[1] = Math.min(Math.max(p[1], world.minY), world.maxY);
+    }
+  }
+  friction(amt) {
+    for (let i = 0; i < this.n; i++) {
+      const p = this.pos[i], q = this.prev[i];
+      if (p[1] >= world.maxY - 0.5 || p[1] <= world.minY + 0.5) q[0] += (p[0] - q[0]) * amt;
+      if (p[0] <= world.minX + 0.5 || p[0] >= world.maxX - 0.5) q[1] += (p[1] - q[1]) * amt;
+    }
+  }
+  impulse(vx, vy) {
+    for (const q of this.prev) { q[0] -= vx * STEP; q[1] -= vy * STEP; }
+  }
+  poke(x, y) {
+    this.centroid();
+    const reach = this.r * 0.9;
+    for (const p of this.pos) {
+      const d = Math.hypot(p[0] - x, p[1] - y);
+      if (d >= reach) continue;
+      const f = 1 - d / reach, dx = this.cx - p[0], dy = this.cy - p[1], l = Math.hypot(dx, dy) || 1;
+      p[0] += dx / l * this.r * 0.35 * f; p[1] += dy / l * this.r * 0.35 * f;
+    }
+    const side = Math.max(-1, Math.min(1, (this.cx - x) / this.r));
+    this.impulse(side * 260, -760);
+  }
+  contains(x, y) {
+    let inside = false;
+    for (let i = 0, j = this.n - 1; i < this.n; j = i++) {
+      const a = this.pos[i], b = this.pos[j];
+      if ((a[1] > y) !== (b[1] > y) && x < (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]) + a[0]) inside = !inside;
+    }
+    return inside;
+  }
+
+  draw(t) {
+    const P = this.pos, n = this.n, r = this.r;
+    let lx = Infinity, ly = Infinity, hx = -Infinity, hy = -Infinity, vx = 0, vy = 0;
+    for (let i = 0; i < n; i++) {
+      lx = Math.min(lx, P[i][0]); ly = Math.min(ly, P[i][1]);
+      hx = Math.max(hx, P[i][0]); hy = Math.max(hy, P[i][1]);
+      vx += P[i][0] - this.prev[i][0]; vy += P[i][1] - this.prev[i][1];
+    }
+    this.vx = vx / n / STEP; this.vy = vy / n / STEP; this.bottom = hy;
+    const cx = (lx + hx) / 2, cy = (ly + hy) / 2, hw = (hx - lx) / 2, hh = (hy - ly) / 2;
+    const sx = hw / r, sy = hh / r;
+    const lookX = Math.max(-1, Math.min(1, this.vx / 1200)) * r * 0.07;
+    const lookY = Math.max(-1, Math.min(1, this.vy / 1200)) * r * 0.07;
+
+    // 影子：离地越高越小越淡
+    const s = Math.max(0.35, 1 - (floorY - hy) / 500);
+    ctx.fillStyle = `rgba(60,50,40,${0.16 * s})`;
+    ctx.beginPath(); ctx.ellipse(cx, floorY, r * s * sx, r * 0.18 * s, 0, 0, Math.PI * 2); ctx.fill();
+
+    // 身体：中点为端点、质点为控制点的平滑闭合曲线
+    ctx.beginPath();
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) {
+      const q = P[(i + 1) % n];
+      ctx.quadraticCurveTo(P[i][0], P[i][1], (P[i][0] + q[0]) / 2, (P[i][1] + q[1]) / 2);
+    }
+    ctx.closePath();
+    const grad = ctx.createRadialGradient(cx - hw * 0.3, cy - hh * 0.4, r * 0.1, cx, cy, r * 1.15);
+    grad.addColorStop(0, shade(this.color, -0.12));
+    grad.addColorStop(1, this.color);
+    ctx.fillStyle = grad; ctx.fill();
+    ctx.lineWidth = Math.max(2.5, r * 0.05); ctx.lineJoin = 'round';
+    ctx.strokeStyle = shade(this.color, 0.22); ctx.stroke();
+
+    const ell = (x, y, w, h, rot, fill) => {
+      ctx.beginPath(); ctx.ellipse(x, y, Math.max(0.1, w), Math.max(0.1, h), rot, 0, Math.PI * 2);
+      ctx.fillStyle = fill; ctx.fill();
+    };
+    // 高光
+    ell(cx - hw * 0.42, cy - hh * 0.5, r * 0.2 * sx, r * 0.11 * sy, -0.5, 'rgba(255,255,255,0.55)');
+
+    if (t >= this.nextBlink) { this.blinkUntil = t + 0.12; this.nextBlink = t + 2 + Math.random() * 3; }
+    const blink = t < this.blinkUntil ? 0.12 : 1;
+    const eye = '#38251F';
+    for (const side of [-1, 1]) {
+      ell(cx + side * hw * 0.52 + lookX * 0.5, cy + hh * 0.04 + lookY * 0.5, r * 0.1 * sx, r * 0.055 * sy, 0, 'rgba(255,115,128,0.38)');
+      const ex = cx + side * hw * 0.3 + lookX, ey = cy - hh * 0.2 + lookY;
+      ell(ex, ey, r * 0.075 * sx, r * 0.115 * sy * blink, 0, eye);
+      if (blink === 1) ell(ex + r * 0.025, ey - r * 0.05 * sy, r * 0.035, r * 0.035, 0, '#fff');
+    }
+    const mx = cx + lookX, my = cy + hh * 0.06 + lookY;
+    const excited = t < this.excitedUntil || Math.hypot(this.vx, this.vy) > 900;
+    ctx.strokeStyle = eye; ctx.lineCap = 'round';
+    if (excited) {
+      ctx.beginPath(); ctx.ellipse(mx, my + r * 0.005, r * 0.065 * sx, r * 0.075 * sy, 0, 0, Math.PI * 2);
+      ctx.fillStyle = '#8C3338'; ctx.fill(); ctx.lineWidth = Math.max(1.5, r * 0.025); ctx.stroke();
+    } else {
+      ctx.beginPath(); ctx.moveTo(mx - r * 0.09 * sx, my);
+      ctx.quadraticCurveTo(mx, my + r * 0.1 * sy, mx + r * 0.09 * sx, my);
+      ctx.lineWidth = Math.max(2, r * 0.035); ctx.stroke();
+    }
+  }
+}
+
+function collide(a, b) {
+  if (Math.hypot(a.cx - b.cx, a.cy - b.cy) > (a.r + b.r) * 1.15) return;
+  push(a, b, b.r / (a.r + b.r)); push(b, a, a.r / (a.r + b.r));
+}
+function push(a, b, share) {
+  const R = b.r * 0.95;
+  for (const p of a.pos) {
+    const dx = p[0] - b.cx, dy = p[1] - b.cy, l = Math.hypot(dx, dy);
+    if (l >= R || l < 1e-6) continue;
+    p[0] += dx / l * (R - l) * share; p[1] += dy / l * (R - l) * share;
+  }
+}
+
+// 原创配色：一家五口
+const family = [[80, '#FFB38A'], [62, '#8EDFB8'], [48, '#C3A6F2'], [36, '#8CCBF5'], [27, '#FFE07A']];
+// 窄屏（手机竖屏）整家等比缩小
+const sizeScale = Math.min(1, W / 600);
+const blobs = family.map(([r, c], i) => new Blob(W * (0.15 + 0.17 * i), H * (0.45 - 0.07 * i), r * sizeScale, c));
+
+let grab = null;
+
+function step() {
+  const a = tilt * 0.6, gx = Math.sin(a) * G, gy = Math.cos(a) * G;
+  for (const b of blobs) b.integrate(gx, gy);
+  if (grab) {
+    // 离手指近的点拉得狠，远的点跟着晃：拎起来会被拉长
+    const b = grab.blob; let ax = 0, ay = 0, tot = 0;
+    b.pos.forEach((p, i) => { ax += p[0] * grab.w[i]; ay += p[1] * grab.w[i]; tot += grab.w[i]; });
+    const dx = grab.x - ax / tot, dy = grab.y - ay / tot;
+    b.pos.forEach((p, i) => { p[0] += dx * grab.w[i] * 0.1; p[1] += dy * grab.w[i] * 0.1; });
+  }
+  for (let it = 0; it < 4; it++) {
+    for (const b of blobs) { b.solveShape(0.03); b.solveEdges(0.5); b.solvePressure(0.6); }
+    for (let i = 0; i < blobs.length; i++) for (let j = i + 1; j < blobs.length; j++) collide(blobs[i], blobs[j]);
+    for (const b of blobs) b.solveBounds();
+  }
+  for (const b of blobs) b.friction(0.15);
+}
+
+function familyHop(tx) {
+  blobs.forEach((b, i) => setTimeout(() => {
+    let vx = (Math.random() - 0.5) * 160;
+    if (tx != null) vx += Math.max(-1, Math.min(1, (tx - b.cx) / 200)) * 260;
+    b.impulse(vx, -(650 + Math.random() * 200));
+    b.excitedUntil = performance.now() / 1000 + 0.5;
+  }, i * 70));
+}
+
+function blobAt(x, y) {
+  return [...blobs].sort((a, b) => a.r - b.r)
+    .find(b => b.contains(x, y) || Math.hypot(b.cx - x, b.cy - y) < b.r * 0.8);
+}
+
+canvas.addEventListener('pointerdown', e => {
+  const b = blobAt(e.clientX, e.clientY);
+  if (!b) { familyHop(e.clientX); return; }
+  const w = b.pos.map(p => { const f = Math.max(0.06, 1 - Math.hypot(p[0] - e.clientX, p[1] - e.clientY) / (b.r * 1.6)); return f * f; });
+  grab = { blob: b, x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, t: performance.now(), w, moved: false };
+  b.excitedUntil = Infinity;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!grab) return;
+  grab.x = e.clientX; grab.y = e.clientY;
+  if (Math.hypot(grab.x - grab.sx, grab.y - grab.sy) > 12) grab.moved = true;
+});
+const release = e => {
+  if (!grab) return;
+  if (!grab.moved && performance.now() - grab.t < 300) grab.blob.poke(e.clientX, e.clientY);
+  grab.blob.excitedUntil = performance.now() / 1000 + 0.6;
+  grab = null;
+};
+canvas.addEventListener('pointerup', release);
+canvas.addEventListener('pointercancel', release);
+
+addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft') tilt = -1;
+  if (e.key === 'ArrowRight') tilt = 1;
+  if (e.key === ' ') { familyHop(null); e.preventDefault(); }
+});
+addEventListener('keyup', e => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') tilt = 0; });
+if (matchMedia('(pointer: coarse)').matches) document.getElementById('hint').textContent = '拖一拖 · 戳一戳 · 点空白处一起跳';
+setTimeout(() => document.getElementById('hint').style.opacity = 0, 8000);
+
+function drawGround() {
+  ctx.fillStyle = '#C8E6B0'; ctx.fillRect(0, floorY, W, H - floorY);
+  ctx.fillStyle = '#A9D38C'; ctx.fillRect(0, floorY, W, 3);
+}
+
+let last = 0, acc = 0;
+function frame(ms) {
+  const t = ms / 1000;
+  if (!last) last = t;
+  acc += Math.min(t - last, 1 / 20); last = t;
+  let steps = 0;
+  while (acc >= STEP && steps < 6) { step(); acc -= STEP; steps++; }
+  ctx.clearRect(0, 0, W, H);
+  drawGround();
+  for (const b of blobs) b.draw(t);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
