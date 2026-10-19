@@ -18,12 +18,18 @@
   canvas { display: block; width: 100vw; height: 100vh; }
   #hint { position: fixed; top: 24px; width: 100%; text-align: center; color: #9A8878;
           font: 15px -apple-system, "PingFang SC", sans-serif; pointer-events: none; transition: opacity 1s; }
+  #envbar { position: fixed; bottom: calc(18px + env(safe-area-inset-bottom)); width: 100%; display: flex; flex-direction: column;
+            align-items: center; gap: 8px; font: 13px -apple-system, "PingFang SC", sans-serif; pointer-events: none; }
+  #envlabel { color: rgba(70, 60, 50, 0.6); }
+  #wx { pointer-events: auto; border: 0; border-radius: 999px; padding: 7px 14px; font: inherit; color: #6B5D50;
+        background: rgba(255, 255, 255, 0.7); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08); }
 </style>
 </head>
 <body>
 <img src="share.png" alt="" width="600" height="600" style="position:absolute;width:0;height:0;opacity:0;pointer-events:none">
 <canvas id="c"></canvas>
 <div id="hint">拖一拖 · 点一下戳它 · 点空白处一起跳 · ← → 倾斜 · 空格跳</div>
+<div id="envbar"><div id="envlabel"></div><button id="wx">☁️ 同步我那里的天气</button></div>
 <script>
 // 网页版原型：一圈 Verlet 质点 + 边长约束 + 内部气压 + 形状回弹（shape matching）
 const canvas = document.getElementById('c');
@@ -42,6 +48,188 @@ function resize() {
 }
 addEventListener('resize', resize);
 resize();
+
+// ---- 真实四季与昼夜（基础层，无需任何权限）+ 真实天气（增强层，玩家授权大致位置才有）----
+// 预览参数：?month=1-12 &hour=0-23 &hemi=s &weather=clear|cloudy|rain|storm|snow|fog|wind &temp=摄氏度
+const Q = new URLSearchParams(location.search);
+const hex = h => { const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; };
+const mixRGB = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+const rgb = (c, a = 1) => `rgba(${c.map(Math.round).join(',')},${a})`;
+const clamp01 = v => Math.max(0, Math.min(1, v));
+
+const SOUTH_TZ = /^(Australia|Antarctica)\/|^Pacific\/(Auckland|Chatham|Fiji|Tongatapu|Noumea|Efate)|^America\/(Argentina|Santiago|Montevideo|Asuncion|Sao_Paulo|Punta_Arenas)|^Africa\/(Johannesburg|Maputo|Harare|Windhoek|Gaborone|Maseru|Mbabane|Lusaka)|^Indian\/(Mauritius|Reunion)/;
+const SEASON_NAMES = { spring: '春天', summer: '夏天', autumn: '秋天', winter: '冬天' };
+const WEATHER_NAMES = { clear: '晴', cloudy: '多云', fog: '有雾', rain: '下雨', storm: '雷雨', snow: '下雪' };
+
+const env = {
+  south: Q.get('hemi') === 's' || (!Q.has('hemi') && SOUTH_TZ.test(Intl.DateTimeFormat().resolvedOptions().timeZone || '')),
+  weather: Q.get('weather') === 'wind' ? 'clear' : Q.get('weather'),  // null = 没有真实天气
+  wind: Q.get('weather') === 'wind' ? 1 : 0,
+  temp: Q.has('temp') ? +Q.get('temp') : null,
+  hour() { if (Q.has('hour')) return +Q.get('hour'); const d = new Date(); return d.getHours() + d.getMinutes() / 60; },
+  season() {
+    let m = Q.has('month') ? +Q.get('month') : new Date().getMonth() + 1;
+    if (this.south) m = (m + 5) % 12 + 1;  // 南半球季节相反
+    return m <= 2 || m === 12 ? 'winter' : m <= 5 ? 'spring' : m <= 8 ? 'summer' : 'autumn';
+  },
+  night() { const h = this.hour(); return h < 5 ? 1 : h < 6.5 ? 1 - (h - 5) / 1.5 : h < 17.5 ? 0 : h < 19.5 ? (h - 17.5) / 2 : 1; },
+  glow() { const h = this.hour(); return Math.max(0, 1 - Math.abs(h - 6.2) / 1.3, 1 - Math.abs(h - 18.3) / 1.3); },
+  phase() { const h = this.hour(); return this.night() > 0.6 ? '夜晚' : h < 9 ? '清晨' : h >= 16.5 ? '傍晚' : '白天'; },
+  wet() { return ['rain', 'storm', 'snow'].includes(this.weather); },
+  // 冷了更紧更 Q，热了软塌塌
+  stiffness() { return this.temp == null ? 1 : this.temp >= 30 ? 0.5 : this.temp <= 0 ? 1.7 : 1; },
+};
+const windNow = t => env.wind * (0.6 + 0.4 * Math.sin(t * 0.7) + 0.3 * Math.sin(t * 2.3));
+
+const SKY_DAY = { spring: '#FFF6E8', summer: '#FFF1D6', autumn: '#FBEAD6', winter: '#EEF2F5' };
+const GROUND = { spring: ['#C8E6B0', '#A9D38C'], summer: ['#A8D98A', '#8CC46C'], autumn: ['#E2C98E', '#C9AC6A'], winter: ['#F4F7F9', '#DCE4EA'] };
+const NIGHT = hex('#1C2444');
+const stars = Array.from({ length: 40 }, () => [Math.random(), Math.random() * 0.6, Math.random() * 1.2 + 0.4, Math.random() * 6]);
+
+function drawSky(t) {
+  const n = env.night(), g = env.glow();
+  let day = hex(SKY_DAY[env.season()]);
+  if (env.weather && env.weather !== 'clear') day = mixRGB(day, hex('#D6DADF'), env.weather === 'cloudy' ? 0.35 : 0.6);
+  const top = mixRGB(mixRGB(day, hex('#F6B48F'), g * 0.5), NIGHT, n);
+  const bottom = mixRGB(mixRGB(day, hex('#FBD3B5'), g * 0.6), hex('#2B3560'), n);
+  const grad = ctx.createLinearGradient(0, 0, 0, floorY);
+  grad.addColorStop(0, rgb(top)); grad.addColorStop(1, rgb(bottom));
+  ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
+  if (n < 0.05 || (env.weather && env.weather !== 'clear')) return;
+  for (const [x, y, r, ph] of stars) {
+    ctx.fillStyle = `rgba(255,250,230,${n * (0.55 + 0.45 * Math.sin(t * 1.5 + ph))})`;
+    ctx.beginPath(); ctx.arc(x * W, y * floorY, r, 0, 7); ctx.fill();
+  }
+  // 弯月：亮圆再盖一个天色圆
+  ctx.fillStyle = `rgba(255,244,210,${n})`; ctx.beginPath(); ctx.arc(W * 0.8, H * 0.12, 16, 0, 7); ctx.fill();
+  ctx.fillStyle = rgb(top); ctx.beginPath(); ctx.arc(W * 0.8 + 7, H * 0.12 - 4, 14, 0, 7); ctx.fill();
+}
+
+const particles = [];
+let particlesSeeded = false;
+function wantParticles() {
+  const s = env.season(), n = env.night(), w = env.weather, want = {};
+  if (w === 'rain') want.rain = 70;
+  if (w === 'storm') want.rain = 120;
+  if (w === 'snow') want.snow = 90; else if (s === 'winter' && !w) want.snow = 35;
+  if (s === 'spring' && !env.wet()) want.petal = 16;
+  if (s === 'autumn' && !env.wet()) want.leaf = 12;
+  if (s === 'summer' && n > 0.5 && !env.wet()) want.firefly = 14;
+  return want;
+}
+function spawn(type, anywhere) {
+  const p = { type, x: Math.random() * W, y: anywhere ? Math.random() * floorY : -10, ph: Math.random() * 6.28, rot: Math.random() * 6.28 };
+  if (type === 'rain') { p.vy = 650 + Math.random() * 200; p.len = 10 + Math.random() * 6; }
+  if (type === 'snow') { p.vy = 30 + Math.random() * 35; p.r = 1.5 + Math.random() * 2; }
+  if (type === 'petal') { p.vy = 25 + Math.random() * 20; p.r = 3 + Math.random() * 2.5; p.c = Math.random() < 0.5 ? '#F7C6D3' : '#FBDDE5'; }
+  if (type === 'leaf') { p.vy = 35 + Math.random() * 30; p.r = 5 + Math.random() * 3; p.c = ['#E59A55', '#D2733C', '#CFA43F'][Math.random() * 3 | 0]; }
+  if (type === 'firefly') { p.y = floorY * (0.45 + Math.random() * 0.5); p.vy = 0; }
+  particles.push(p);
+}
+function updateParticles(dt, t) {
+  const want = wantParticles(), have = {};
+  for (const p of particles) have[p.type] = (have[p.type] || 0) + 1;
+  for (const type in want) for (let i = have[type] || 0; i < want[type]; i++) spawn(type, !particlesSeeded || type === 'firefly');
+  particlesSeeded = true;
+  const wind = windNow(t) * 160;
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    if (!want[p.type]) { particles.splice(i, 1); continue; }
+    if (p.type === 'firefly') { p.x += Math.sin(t * 0.8 + p.ph) * 20 * dt; p.y += Math.cos(t * 0.6 + p.ph * 2) * 14 * dt; continue; }
+    const sway = p.type === 'rain' ? 0 : Math.sin(t * 1.3 + p.ph) * (p.type === 'leaf' ? 40 : 18);
+    p.x += (sway + wind * (p.type === 'rain' ? 0.6 : 1)) * dt; p.y += p.vy * dt; p.rot += dt * (p.type === 'leaf' ? 2 : 1);
+    if (p.x < -20) p.x += W + 40; else if (p.x > W + 20) p.x -= W + 40;
+    if (p.type === 'rain' || p.type === 'snow') {
+      // 雨点打在身上砸出小坑，雪花落在头上积起来
+      const b = blobs.find(b => Math.abs(b.cx - p.x) < b.r * 1.4 && Math.abs(b.cy - p.y) < b.r * 1.4 && b.contains(p.x, p.y));
+      if (b) {
+        if (p.type === 'rain') b.dent(p.x, p.y, 0.025); else b.snow = Math.min(1, b.snow + 0.03);
+        particles.splice(i, 1); continue;
+      }
+    }
+    if (p.y > floorY + (p.type === 'rain' ? 0 : 6)) particles.splice(i, 1);
+  }
+}
+function drawParticles(t, glowing) {
+  const wind = windNow(t) * 160;
+  for (const p of particles) {
+    if ((p.type === 'firefly') !== glowing) continue;
+    if (p.type === 'rain') {
+      ctx.strokeStyle = 'rgba(140,160,190,0.55)'; ctx.lineWidth = 1.2; ctx.beginPath();
+      ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - wind * 0.012, p.y - p.len); ctx.stroke();
+    } else if (p.type === 'snow') {
+      ctx.fillStyle = 'rgba(255,255,255,0.92)'; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+    } else if (p.type === 'firefly') {
+      // 叠加发光，暗处不会发灰
+      const a = 0.35 + 0.65 * Math.max(0, Math.sin(t * 2 + p.ph));
+      ctx.globalCompositeOperation = 'lighter';
+      const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 9);
+      g.addColorStop(0, `rgba(200,255,120,${a * 0.5})`); g.addColorStop(1, 'rgba(200,255,120,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, 7); ctx.fill();
+      ctx.fillStyle = `rgba(245,255,190,${a})`; ctx.beginPath(); ctx.arc(p.x, p.y, 1.8, 0, 7); ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+    } else {
+      ctx.fillStyle = p.c; ctx.beginPath(); ctx.ellipse(p.x, p.y, p.r, p.r * 0.55, p.rot, 0, 7); ctx.fill();
+    }
+  }
+}
+
+let flashUntil = 0;
+function drawOverlay(t) {
+  const n = env.night();
+  if (n > 0) { ctx.fillStyle = `rgba(18,24,58,${0.28 * n})`; ctx.fillRect(0, 0, W, H); }
+  if (env.weather === 'fog') {
+    ctx.fillStyle = 'rgba(236,238,241,0.38)'; ctx.fillRect(0, 0, W, H);
+    for (let i = 0; i < 3; i++) {
+      const y = floorY * (0.35 + i * 0.22), x = ((t * (8 + i * 4)) % (W + 300)) - 300;
+      ctx.fillStyle = 'rgba(245,246,248,0.45)'; ctx.beginPath(); ctx.ellipse(x + 150, y, 220, 26, 0, 0, 7); ctx.fill();
+    }
+  }
+  if (env.weather === 'storm' && t > flashUntil + 3 && Math.random() < 0.004) flashUntil = t + 0.12;
+  if (t < flashUntil) { ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.fillRect(0, 0, W, H); }
+}
+
+const WMO = c => c === 0 ? 'clear' : c <= 3 ? 'cloudy' : c <= 48 ? 'fog' : (c <= 67 || (c >= 80 && c <= 82)) ? 'rain' : (c <= 77 || c === 85 || c === 86) ? 'snow' : 'storm';
+const wxButton = document.getElementById('wx');
+function updateEnvLabel() {
+  let text = `${env.south ? '南半球' : '北半球'} · ${SEASON_NAMES[env.season()]} · ${env.phase()}`;
+  if (env.weather) text += ` · ${WEATHER_NAMES[env.weather]}${env.wind > 0.3 ? '有风' : ''}${env.temp != null ? ' ' + Math.round(env.temp) + '°C' : ''}`;
+  const label = document.getElementById('envlabel');
+  label.textContent = text;
+  const dark = env.night() > 0.5;
+  label.style.color = dark ? 'rgba(230,225,240,0.7)' : 'rgba(70,60,50,0.6)';
+  document.getElementById('hint').style.color = dark ? '#C9C3D8' : '#9A8878';
+  wxButton.style.display = env.weather ? 'none' : '';
+}
+async function syncWeather(lat, lon) {
+  // 只把保留一位小数的经纬度（约 10 公里精度）发给天气接口，不上传到其他地方
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(1)}&longitude=${lon.toFixed(1)}&current=weather_code,temperature_2m,wind_speed_10m`;
+  const cur = (await (await fetch(url)).json()).current;
+  env.weather = WMO(cur.weather_code);
+  env.temp = cur.temperature_2m;
+  env.wind = clamp01((cur.wind_speed_10m - 15) / 25);
+  env.south = lat < 0;
+  updateEnvLabel();
+}
+function loadSavedPlace() { try { return JSON.parse(localStorage.getItem('jelly-place')); } catch { return null; } }
+wxButton.addEventListener('click', () => {
+  if (!navigator.geolocation) { wxButton.textContent = '这个浏览器拿不到位置'; return; }
+  wxButton.textContent = '正在获取…';
+  navigator.geolocation.getCurrentPosition(async pos => {
+    const place = { lat: +pos.coords.latitude.toFixed(1), lon: +pos.coords.longitude.toFixed(1) };
+    try { localStorage.setItem('jelly-place', JSON.stringify(place)); } catch {}
+    try { await syncWeather(place.lat, place.lon); track('weather-on'); }
+    catch { wxButton.textContent = '没拿到天气，稍后再试'; }
+  }, () => { wxButton.textContent = '没有位置也没关系，四季和昼夜照样同步'; },
+  { enableHighAccuracy: false, maximumAge: 3600e3, timeout: 15000 });
+});
+if (!Q.has('weather')) {
+  const place = loadSavedPlace();
+  if (place) syncWeather(place.lat, place.lon).catch(() => {});
+  setInterval(() => { const p = loadSavedPlace(); if (p) syncWeather(p.lat, p.lon).catch(() => {}); }, 30 * 60e3);
+}
+updateEnvLabel();
+setInterval(updateEnvLabel, 60e3);
 
 function shade(hex, amt) {
   const n = parseInt(hex.slice(1), 16);
@@ -72,6 +260,7 @@ class Blob {
     }
     this.restAreaUnit = area * 0.5;
     this.held = false;
+    this.snow = 0;
     this.cx = x; this.cy = y; this.vx = 0; this.vy = 0;
     this.excitedUntil = 0; this.nextBlink = 0; this.blinkUntil = 0;
     this.grounded = false;
@@ -165,6 +354,14 @@ class Blob {
     const side = Math.max(-1, Math.min(1, (this.cx - x) / this.r));
     this.impulse(side * 260, -760);
   }
+  dent(x, y, amt) {
+    let k = 0, best = Infinity;
+    this.pos.forEach((p, i) => { const d = Math.hypot(p[0] - x, p[1] - y); if (d < best) { best = d; k = i; } });
+    for (const [d, w] of [[0, 1], [-1, 0.5], [1, 0.5]]) {
+      const p = this.pos[(k + d + this.n) % this.n], dx = this.cx - p[0], dy = this.cy - p[1], l = Math.hypot(dx, dy) || 1;
+      p[0] += dx / l * this.r * amt * w; p[1] += dy / l * this.r * amt * w;
+    }
+  }
   contains(x, y) {
     let inside = false;
     for (let i = 0, j = this.n - 1; i < this.n; j = i++) {
@@ -213,11 +410,24 @@ class Blob {
     if (t >= this.nextBlink) { this.blinkUntil = t + 0.12; this.nextBlink = t + 2 + Math.random() * 3; }
     const blink = t < this.blinkUntil ? 0.12 : 1;
     const eye = '#38251F';
+    // 夜里睡觉；被戳、被拎、被弹起来会醒一会儿
+    const asleep = env.night() > 0.6 && !this.held && t > this.excitedUntil + 4 && Math.hypot(this.vx, this.vy) < 200;
     for (const side of [-1, 1]) {
       ell(cx + side * r * 0.52 * sx + lookX * 0.5, cy + r * 0.04 * sy + lookY * 0.5, r * 0.1 * sx, r * 0.055 * sy, 0, 'rgba(255,115,128,0.38)');
       const ex = cx + side * r * 0.3 * sx + lookX, ey = cy - r * 0.2 * sy + lookY;
+      if (asleep) {
+        ctx.strokeStyle = eye; ctx.lineWidth = Math.max(1.5, r * 0.03); ctx.lineCap = 'round'; ctx.beginPath();
+        ctx.moveTo(ex - r * 0.07 * sx, ey); ctx.quadraticCurveTo(ex, ey + r * 0.06 * sy, ex + r * 0.07 * sx, ey); ctx.stroke();
+        continue;
+      }
       ell(ex, ey, r * 0.075 * sx, r * 0.115 * sy * blink, 0, eye);
       if (blink === 1) ell(ex + r * 0.025, ey - r * 0.05 * sy, r * 0.035, r * 0.035, 0, '#fff');
+    }
+    if (asleep) {
+      const ph = (t * 0.45 + this.r * 0.37) % 1;
+      ctx.fillStyle = `rgba(235,230,250,${0.8 * (1 - ph)})`;
+      ctx.font = `600 ${Math.round(r * 0.22 + ph * r * 0.12)}px -apple-system, sans-serif`;
+      ctx.fillText('z', cx + r * (0.55 + ph * 0.25) * sx, cy - r * (0.75 + ph * 0.55));
     }
     const mx = cx + lookX, my = cy + r * 0.06 * sy + lookY;
     const excited = t < this.excitedUntil || Math.hypot(this.vx, this.vy) > 900;
@@ -229,6 +439,13 @@ class Blob {
       ctx.beginPath(); ctx.moveTo(mx - r * 0.09 * sx, my);
       ctx.quadraticCurveTo(mx, my + r * 0.1 * sy, mx + r * 0.09 * sx, my);
       ctx.lineWidth = Math.max(2, r * 0.035); ctx.stroke();
+    }
+    // 头顶积雪：甩一甩就掉，不下雪时慢慢化掉
+    if (Math.hypot(this.vx, this.vy) > 650) this.snow *= 0.85;
+    if (env.weather !== 'snow' && env.season() !== 'winter') this.snow *= 0.995;
+    if (this.snow > 0.03) {
+      const top = P.reduce((a, p) => p[1] < a[1] ? p : a);
+      ell(top[0], top[1] + r * 0.05, r * (0.12 + 0.4 * this.snow) * sx, r * (0.05 + 0.12 * this.snow), 0, 'rgba(255,255,255,0.96)');
     }
   }
 }
@@ -302,7 +519,8 @@ const blobs = family.map(([r, c, style], i) => new Blob(W * (0.15 + 0.17 * i), H
 let grab = null;
 
 function step() {
-  const a = tilt * 0.6, gx = Math.sin(a) * G, gy = Math.cos(a) * G;
+  const a = tilt * 0.6, gx = Math.sin(a) * G + windNow(performance.now() / 1000) * 520, gy = Math.cos(a) * G;
+  const shapeK = 0.03 * env.stiffness();
   for (const b of blobs) b.integrate(gx, gy);
   for (let it = 0; it < 4; it++) {
     if (grab) {
@@ -313,7 +531,7 @@ function step() {
         p[0] += (grab.x - p[0]) * w; p[1] += (grab.y - p[1]) * w;
       }
     }
-    for (const b of blobs) { b.solveShape(b.held ? 0.004 : 0.03); b.solveEdges(0.5); b.solvePressure(0.6); }
+    for (const b of blobs) { b.solveShape(b.held ? 0.004 : shapeK); b.solveEdges(0.5); b.solvePressure(0.6); }
     for (let i = 0; i < blobs.length; i++) for (let j = i + 1; j < blobs.length; j++) collide(blobs[i], blobs[j]);
     for (const b of blobs) b.solveBounds();
   }
@@ -368,20 +586,26 @@ if (matchMedia('(pointer: coarse)').matches) document.getElementById('hint').tex
 setTimeout(() => document.getElementById('hint').style.opacity = 0, 8000);
 
 function drawGround() {
-  ctx.fillStyle = '#C8E6B0'; ctx.fillRect(0, floorY, W, H - floorY);
-  ctx.fillStyle = '#A9D38C'; ctx.fillRect(0, floorY, W, 3);
+  const [fill, edge] = GROUND[env.season()].map(hex), n = env.night() * 0.35;
+  ctx.fillStyle = rgb(mixRGB(fill, NIGHT, n)); ctx.fillRect(0, floorY, W, H - floorY);
+  ctx.fillStyle = rgb(mixRGB(edge, NIGHT, n)); ctx.fillRect(0, floorY, W, 3);
 }
 
 let last = 0, acc = 0;
 function frame(ms) {
   const t = ms / 1000;
   if (!last) last = t;
-  acc += Math.min(t - last, 1 / 20); last = t;
+  const dt = Math.min(t - last, 1 / 20);
+  acc += dt; last = t;
   let steps = 0;
   while (acc >= STEP && steps < 6) { step(); acc -= STEP; steps++; }
-  ctx.fillStyle = '#FFF6E8'; ctx.fillRect(0, 0, W, H);
+  drawSky(t);
   drawGround();
   for (const b of blobs) b.draw(t);
+  updateParticles(dt, t);
+  drawParticles(t, false);
+  drawOverlay(t);
+  drawParticles(t, true);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
