@@ -367,7 +367,7 @@ function frame(ms) {
   acc += Math.min(t - last, 1 / 20); last = t;
   let steps = 0;
   while (acc >= STEP && steps < 6) { step(); acc -= STEP; steps++; }
-  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#FFF6E8'; ctx.fillRect(0, 0, W, H);
   drawGround();
   for (const b of blobs) b.draw(t);
   requestAnimationFrame(frame);
