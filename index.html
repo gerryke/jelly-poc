@@ -269,7 +269,19 @@ function outline(P, n, r, style) {
 }
 
 function collide(a, b) {
-  if (Math.hypot(a.cx - b.cx, a.cy - b.cy) > (a.r + b.r) * 1.15) return;
+  const gap = Math.hypot(a.cx - b.cx, a.cy - b.cy);
+  if (gap > (a.r + b.r) * 1.15) return;
+  // 中心靠得太近（小的钻进了大的肚子里）：两个身体整体往反方向挪开一点
+  const minGap = (a.r + b.r) * 0.7;
+  if (gap < minGap) {
+    let dx = a.cx - b.cx, dy = a.cy - b.cy;
+    if (gap < 1e-3) { dx = 1; dy = 0; } else { dx /= gap; dy /= gap; }
+    const shift = (minGap - gap) * 0.15, sa = b.r / (a.r + b.r), sb = a.r / (a.r + b.r);
+    for (const p of a.pos) { p[0] += dx * shift * sa; p[1] += dy * shift * sa; }
+    for (const p of b.pos) { p[0] -= dx * shift * sb; p[1] -= dy * shift * sb; }
+    a.cx += dx * shift * sa; a.cy += dy * shift * sa;
+    b.cx -= dx * shift * sb; b.cy -= dy * shift * sb;
+  }
   push(a, b, b.r / (a.r + b.r)); push(b, a, a.r / (a.r + b.r));
 }
 function push(a, b, share) {
