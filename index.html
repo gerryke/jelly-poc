@@ -324,21 +324,21 @@ function blobAt(x, y) {
 
 canvas.addEventListener('pointerdown', e => {
   const b = blobAt(e.clientX, e.clientY);
-  if (!b) { familyHop(e.clientX); return; }
+  if (!b) { familyHop(e.clientX); track('hop'); return; }
   let idx = 0, best = Infinity;
   b.pos.forEach((p, i) => { const d = Math.hypot(p[0] - e.clientX, p[1] - e.clientY); if (d < best) { best = d; idx = i; } });
   grab = { blob: b, x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, t: performance.now(), idx, moved: false };
   b.excitedUntil = Infinity;
-  canvas.setPointerCapture(e.pointerId);
+  try { canvas.setPointerCapture(e.pointerId); } catch {}
 });
 canvas.addEventListener('pointermove', e => {
   if (!grab) return;
   grab.x = e.clientX; grab.y = e.clientY;
-  if (Math.hypot(grab.x - grab.sx, grab.y - grab.sy) > 12) { grab.moved = true; grab.blob.held = true; }
+  if (Math.hypot(grab.x - grab.sx, grab.y - grab.sy) > 12) { grab.moved = true; grab.blob.held = true; track('grab'); }
 });
 const release = e => {
   if (!grab) return;
-  if (!grab.moved && performance.now() - grab.t < 300) grab.blob.poke(e.clientX, e.clientY);
+  if (!grab.moved && performance.now() - grab.t < 300) { grab.blob.poke(e.clientX, e.clientY); track('poke'); }
   grab.blob.held = false;
   grab.blob.excitedUntil = performance.now() / 1000 + 0.6;
   grab = null;
@@ -374,5 +374,21 @@ function frame(ms) {
 }
 requestAnimationFrame(frame);
 </script>
+<script>
+// 访问统计（GoatCounter，无 cookie、不记录个人信息）：每次访问只记一次各类互动，以及页面停留时长的几个里程碑
+const tracked = new Set();
+function track(name) {
+  if (tracked.has(name)) return;
+  tracked.add(name);
+  if (window.goatcounter && window.goatcounter.count) window.goatcounter.count({ path: name, title: name, event: true });
+}
+let visibleSeconds = 0;
+setInterval(() => {
+  if (document.hidden) return;
+  visibleSeconds += 5;
+  for (const [s, name] of [[30, 'stay-30s'], [120, 'stay-2min'], [300, 'stay-5min']]) if (visibleSeconds >= s) track(name);
+}, 5000);
+</script>
+<script data-goatcounter="https://gerryke.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
 </body>
 </html>
